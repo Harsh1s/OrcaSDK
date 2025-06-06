@@ -1,0 +1,14 @@
+# Cargo.toml
+[package]
+name = "orca_swap_demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+bs58 = "0.4"
+solana-client = "2.2.1"
+solana-sdk    = "2.2.1"
+orca_tx_sender   = "0.1.0"
+orca_whirlpools  = "2.0.4"
