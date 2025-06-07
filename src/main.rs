@@ -1,4 +1,4 @@
-use std::{str::FromStr, time::Duration};
+use std::{collections::HashSet, str::FromStr, time::Duration};
 
 use anyhow::{anyhow, Result};
 use bs58::decode;
@@ -90,8 +90,22 @@ async fn create_v0_tx_with_lookup(
     )?);
     println!("Message compiled successfully.");
 
-    let mut signers_to_provide: Vec<&Keypair> = vec![payer];
-    signers_to_provide.extend_from_slice(extra_signers);
+    // Create a deduplicated signers list
+    let mut signers_set = HashSet::new();
+    let mut signers_to_provide: Vec<&Keypair> = Vec::new();
+
+    // Add payer first (always required)
+    signers_set.insert(payer.pubkey());
+    signers_to_provide.push(payer);
+
+    // Add the rest of signers, avoiding duplicates
+    for signer in extra_signers {
+        if signers_set.insert(signer.pubkey()) {
+            signers_to_provide.push(signer);
+        } else {
+            println!("INFO: Skipping duplicate signer: {}", signer.pubkey());
+        }
+    }
 
     if let VersionedMessage::V0(ref v0_msg) = message {
         println!("\n--- Signer Debugging ---");
@@ -253,8 +267,25 @@ async fn main() -> Result<()> {
         println!("Instruction {}: {:?}", i, ix.accounts);
     }
 
-    let mut all_signers = vec![&wallet, &transfer_authority];
-    all_signers.extend(swap_res.additional_signers.iter().map(|k| k));
+    // Create a deduplicated signers list
+    let mut unique_signers = HashSet::new();
+    let mut all_signers = Vec::new();
+
+    // Add required signers first
+    unique_signers.insert(wallet.pubkey());
+    all_signers.push(&wallet);
+
+    unique_signers.insert(transfer_authority.pubkey());
+    all_signers.push(&transfer_authority);
+
+    // Add any additional signers without duplicates
+    for signer in swap_res.additional_signers.iter() {
+        if unique_signers.insert(signer.pubkey()) {
+            all_signers.push(signer);
+        } else {
+            println!("Skipping duplicate signer: {}", signer.pubkey());
+        }
+    }
 
     println!("Creating Address Lookup Table (ALT)...");
     let creation_slot = rpc
