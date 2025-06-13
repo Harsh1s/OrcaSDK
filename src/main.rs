@@ -71,7 +71,16 @@ async fn create_v0_tx_with_lookup(
     extra_signers: &[&Keypair],
 ) -> Result<VersionedTransaction> {
     println!("Fetching ALT {}...", lookup_table_key);
-    let alt_account = fetch_address_lookup_table(rpc, &lookup_table_key).await?;
+    let mut alt_account = fetch_address_lookup_table(rpc, &lookup_table_key).await?;
+    // Wait and fetch again with higher commitment to ensure finalized
+    sleep(Duration::from_secs(5)).await;
+    alt_account = fetch_address_lookup_table(rpc, &lookup_table_key).await?;
+
+    // After fetching the ALT
+    println!("ALT contains {} addresses:", alt_account.addresses.len());
+    for (i, addr) in alt_account.addresses.iter().enumerate() {
+        println!("  [{}]: {}", i, addr);
+    }
 
     println!("Fetching recent blockhash...");
     let blockhash = rpc
@@ -85,10 +94,29 @@ async fn create_v0_tx_with_lookup(
     let message = VersionedMessage::V0(v0::Message::try_compile(
         &payer.pubkey(),
         &ixns,
-        &[alt_account],
+        &[alt_account.clone()],
         blockhash,
     )?);
     println!("Message compiled successfully.");
+
+    // --- Insert account presence check here ---
+    // Collect all accounts used in the instructions
+    let all_accounts: Vec<Pubkey> = ixns
+        .iter()
+        .flat_map(|ix| ix.accounts.iter().map(|am| am.pubkey))
+        .collect();
+
+    if let VersionedMessage::V0(ref v0_msg) = message {
+        for account in &all_accounts {
+            if !alt_account.addresses.contains(account) && !v0_msg.account_keys.contains(account) {
+                println!(
+                    "WARNING: Account {} not found in ALT or static accounts",
+                    account
+                );
+            }
+        }
+    }
+    // --- End account presence check ---
 
     // Create a deduplicated signers list
     let mut signers_set = HashSet::new();
@@ -370,7 +398,8 @@ async fn main() -> Result<()> {
             )
             .await?;
         println!("ALT extension chunk confirmed. Signature: {}", extend_sig);
-        sleep(Duration::from_secs(2)).await;
+        println!("Waiting for ALT update to finalize...");
+        sleep(Duration::from_secs(10)).await; // Increased from 2 seconds
     }
     println!("Finished extending ALT {}.", lut_key);
     sleep(Duration::from_secs(5)).await;
@@ -383,9 +412,36 @@ async fn main() -> Result<()> {
         create_v0_tx_with_lookup(&rpc, &wallet, swap_res.instructions, lut_key, &all_signers)
             .await?;
 
+    // Before sending the transaction
+    if let VersionedMessage::V0(ref v0_msg) = v0_swap_tx.message {
+        println!("Validating V0 transaction lookups...");
+
+        // Fetch the ALT again to validate against the transaction
+        let alt_account = fetch_address_lookup_table(&rpc, &lut_key).await?;
+
+        // Check lookup table contents vs transaction needs
+        for (table_idx, table) in v0_msg.address_table_lookups.iter().enumerate() {
+            if table.account_key != lut_key {
+                println!("WARNING: Transaction uses unexpected ALT: {}", table.account_key);
+            }
+
+            let max_readonly_idx = table.readonly_indexes.iter().max().unwrap_or(&0);
+            let max_writable_idx = table.writable_indexes.iter().max().unwrap_or(&0);
+            let max_idx = std::cmp::max(*max_readonly_idx, *max_writable_idx);
+
+            if max_idx as usize >= alt_account.addresses.len() {
+                println!(
+                    "ERROR: Transaction wants to access index {} but ALT only has {} addresses",
+                    max_idx,
+                    alt_account.addresses.len()
+                );
+                return Err(anyhow!("Invalid ALT index in transaction"));
+            }
+        }
+    }
+
     println!("Sending V0 swap transaction...");
     let swap_sig = rpc.send_transaction(&v0_swap_tx).await?;
-    println!("V0 Swap transaction sent. Signature: {}", swap_sig);
 
     println!("Waiting for swap confirmation...");
     rpc.confirm_transaction_with_commitment(
