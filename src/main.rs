@@ -10,6 +10,7 @@ use solana_sdk::{
         AddressLookupTableAccount,
     },
     commitment_config::CommitmentLevel,
+    hash::Hash,
     instruction::Instruction,
     message::{v0, VersionedMessage},
     pubkey::Pubkey,
@@ -69,6 +70,7 @@ async fn create_v0_tx_with_lookup(
     ixns: Vec<Instruction>,
     lookup_table_key: Pubkey,
     extra_signers: &[&Keypair],
+    blockhash: Hash, // Accept blockhash as a parameter
 ) -> Result<VersionedTransaction> {
     println!("Fetching ALT {}...", lookup_table_key);
     let mut alt_account = fetch_address_lookup_table(rpc, &lookup_table_key).await?;
@@ -82,15 +84,7 @@ async fn create_v0_tx_with_lookup(
         println!("  [{}]: {}", i, addr);
     }
 
-    println!("Fetching recent blockhash...");
-    let blockhash = rpc
-        .get_latest_blockhash_with_commitment(orca_tx_sender::CommitmentConfig {
-            commitment: CommitmentLevel::Confirmed,
-        })
-        .await?
-        .0;
-
-    println!("Compiling V0 message...");
+    println!("Compiling V0 message with provided blockhash...");
     let message = VersionedMessage::V0(v0::Message::try_compile(
         &payer.pubkey(),
         &ixns,
@@ -408,38 +402,26 @@ async fn main() -> Result<()> {
         "Creating the final V0 swap transaction using ALT {}...",
         lut_key
     );
-    let v0_swap_tx =
-        create_v0_tx_with_lookup(&rpc, &wallet, swap_res.instructions, lut_key, &all_signers)
-            .await?;
+    // Get a fresh blockhash right before creating the transaction
+    println!("Fetching fresh blockhash for transaction...");
+    let blockhash = rpc
+        .get_latest_blockhash_with_commitment(orca_tx_sender::CommitmentConfig {
+            commitment: CommitmentLevel::Finalized, // Use finalized to ensure it's recognized
+        })
+        .await?
+        .0;
 
-    // Before sending the transaction
-    if let VersionedMessage::V0(ref v0_msg) = v0_swap_tx.message {
-        println!("Validating V0 transaction lookups...");
+    let v0_swap_tx = create_v0_tx_with_lookup(
+        &rpc,
+        &wallet,
+        swap_res.instructions,
+        lut_key,
+        &all_signers,
+        blockhash,
+    )
+    .await?;
 
-        // Fetch the ALT again to validate against the transaction
-        let alt_account = fetch_address_lookup_table(&rpc, &lut_key).await?;
-
-        // Check lookup table contents vs transaction needs
-        for (table_idx, table) in v0_msg.address_table_lookups.iter().enumerate() {
-            if table.account_key != lut_key {
-                println!("WARNING: Transaction uses unexpected ALT: {}", table.account_key);
-            }
-
-            let max_readonly_idx = table.readonly_indexes.iter().max().unwrap_or(&0);
-            let max_writable_idx = table.writable_indexes.iter().max().unwrap_or(&0);
-            let max_idx = std::cmp::max(*max_readonly_idx, *max_writable_idx);
-
-            if max_idx as usize >= alt_account.addresses.len() {
-                println!(
-                    "ERROR: Transaction wants to access index {} but ALT only has {} addresses",
-                    max_idx,
-                    alt_account.addresses.len()
-                );
-                return Err(anyhow!("Invalid ALT index in transaction"));
-            }
-        }
-    }
-
+    // Send immediately after creation to avoid blockhash expiration
     println!("Sending V0 swap transaction...");
     let swap_sig = rpc.send_transaction(&v0_swap_tx).await?;
 
