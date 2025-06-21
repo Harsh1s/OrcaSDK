@@ -13,11 +13,14 @@ use solana_sdk::{
     hash::Hash,
     instruction::Instruction,
     message::{v0, VersionedMessage},
+    program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     signer::SeedDerivable,
+    system_instruction,
     transaction::{Transaction, VersionedTransaction},
 };
+use spl_token;
 use tokio::time::sleep;
 
 use orca_tx_sender::{get_rpc_client, set_rpc};
@@ -70,15 +73,13 @@ async fn create_v0_tx_with_lookup(
     ixns: Vec<Instruction>,
     lookup_table_key: Pubkey,
     extra_signers: &[&Keypair],
-    blockhash: Hash, // Accept blockhash as a parameter
+    blockhash: Hash,
 ) -> Result<VersionedTransaction> {
     println!("Fetching ALT {}...", lookup_table_key);
     let mut alt_account = fetch_address_lookup_table(rpc, &lookup_table_key).await?;
-    // Wait and fetch again with higher commitment to ensure finalized
     sleep(Duration::from_secs(5)).await;
     alt_account = fetch_address_lookup_table(rpc, &lookup_table_key).await?;
 
-    // After fetching the ALT
     println!("ALT contains {} addresses:", alt_account.addresses.len());
     for (i, addr) in alt_account.addresses.iter().enumerate() {
         println!("  [{}]: {}", i, addr);
@@ -93,8 +94,6 @@ async fn create_v0_tx_with_lookup(
     )?);
     println!("Message compiled successfully.");
 
-    // --- Insert account presence check here ---
-    // Collect all accounts used in the instructions
     let all_accounts: Vec<Pubkey> = ixns
         .iter()
         .flat_map(|ix| ix.accounts.iter().map(|am| am.pubkey))
@@ -110,17 +109,12 @@ async fn create_v0_tx_with_lookup(
             }
         }
     }
-    // --- End account presence check ---
-
-    // Create a deduplicated signers list
     let mut signers_set = HashSet::new();
     let mut signers_to_provide: Vec<&Keypair> = Vec::new();
 
-    // Add payer first (always required)
     signers_set.insert(payer.pubkey());
     signers_to_provide.push(payer);
 
-    // Add the rest of signers, avoiding duplicates
     for signer in extra_signers {
         if signers_set.insert(signer.pubkey()) {
             signers_to_provide.push(signer);
@@ -257,6 +251,55 @@ async fn main() -> Result<()> {
         source_token_account.pubkey()
     );
 
+    let rent_exemption = rpc
+        .get_minimum_balance_for_rent_exemption(spl_token::state::Account::LEN)
+        .await?;
+
+    println!(
+        "Funding Transfer Authority with {} lamports...",
+        rent_exemption
+    );
+    let fund_transfer_auth_ix = system_instruction::transfer(
+        &wallet.pubkey(),
+        &transfer_authority.pubkey(),
+        rent_exemption,
+    );
+
+    println!(
+        "Funding Source Token Account with {} lamports...",
+        rent_exemption
+    );
+    let fund_source_account_ix = system_instruction::transfer(
+        &wallet.pubkey(),
+        &source_token_account.pubkey(),
+        rent_exemption,
+    );
+
+    let fund_bh = rpc
+        .get_latest_blockhash_with_commitment(orca_tx_sender::CommitmentConfig {
+            commitment: CommitmentLevel::Confirmed,
+        })
+        .await?
+        .0;
+
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[fund_transfer_auth_ix, fund_source_account_ix],
+        Some(&wallet.pubkey()),
+        &[&wallet],
+        fund_bh,
+    );
+
+    let fund_sig = rpc
+        .send_and_confirm_transaction_with_spinner_and_commitment(
+            &fund_tx,
+            orca_tx_sender::CommitmentConfig {
+                commitment: CommitmentLevel::Confirmed,
+            },
+        )
+        .await?;
+    println!("Both accounts funded. Signature: {}", fund_sig);
+    sleep(Duration::from_secs(3)).await;
+
     let whirlpool_address_str = "3KBZiL2g8C7tiJ32hTv5v3KM7aK9htpqTw4cTXz1HvPt";
     let mint_in_str = "So11111111111111111111111111111111111111112";
     let whirlpool = Pubkey::from_str(whirlpool_address_str)?;
@@ -289,18 +332,15 @@ async fn main() -> Result<()> {
         println!("Instruction {}: {:?}", i, ix.accounts);
     }
 
-    // Create a deduplicated signers list
     let mut unique_signers = HashSet::new();
     let mut all_signers = Vec::new();
 
-    // Add required signers first
     unique_signers.insert(wallet.pubkey());
     all_signers.push(&wallet);
 
     unique_signers.insert(transfer_authority.pubkey());
     all_signers.push(&transfer_authority);
 
-    // Add any additional signers without duplicates
     for signer in swap_res.additional_signers.iter() {
         if unique_signers.insert(signer.pubkey()) {
             all_signers.push(signer);
@@ -393,7 +433,7 @@ async fn main() -> Result<()> {
             .await?;
         println!("ALT extension chunk confirmed. Signature: {}", extend_sig);
         println!("Waiting for ALT update to finalize...");
-        sleep(Duration::from_secs(10)).await; // Increased from 2 seconds
+        sleep(Duration::from_secs(10)).await;
     }
     println!("Finished extending ALT {}.", lut_key);
     sleep(Duration::from_secs(5)).await;
@@ -402,11 +442,10 @@ async fn main() -> Result<()> {
         "Creating the final V0 swap transaction using ALT {}...",
         lut_key
     );
-    // Get a fresh blockhash right before creating the transaction
     println!("Fetching fresh blockhash for transaction...");
     let blockhash = rpc
         .get_latest_blockhash_with_commitment(orca_tx_sender::CommitmentConfig {
-            commitment: CommitmentLevel::Finalized, // Use finalized to ensure it's recognized
+            commitment: CommitmentLevel::Finalized,
         })
         .await?
         .0;
@@ -421,7 +460,6 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    // Send immediately after creation to avoid blockhash expiration
     println!("Sending V0 swap transaction...");
     let swap_sig = rpc.send_transaction(&v0_swap_tx).await?;
 

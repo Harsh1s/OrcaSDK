@@ -7,8 +7,9 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
-bs58 = "0.4"
+bs58 = "0.5.1"
 solana-client = "2.2.1"
 solana-sdk    = "2.2.1"
-orca_tx_sender   = "0.1.0"
+orca_tx_sender   = "1.0.0"
 orca_whirlpools  = "2.0.4"
+spl-token = "8.0.0"
