@@ -77,7 +77,7 @@ async fn create_v0_tx_with_lookup(
 ) -> Result<VersionedTransaction> {
     println!("Fetching ALT {}...", lookup_table_key);
     let mut alt_account = fetch_address_lookup_table(rpc, &lookup_table_key).await?;
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(5)).await; // Note: Still has the double fetch & sleep pattern
     alt_account = fetch_address_lookup_table(rpc, &lookup_table_key).await?;
 
     println!("ALT contains {} addresses:", alt_account.addresses.len());
@@ -94,34 +94,37 @@ async fn create_v0_tx_with_lookup(
     )?);
     println!("Message compiled successfully.");
 
-    let all_accounts: Vec<Pubkey> = ixns
+    // Basic check that all instruction accounts are covered (ALT or static)
+    let all_instruction_accounts: Vec<Pubkey> = ixns
         .iter()
         .flat_map(|ix| ix.accounts.iter().map(|am| am.pubkey))
         .collect();
 
     if let VersionedMessage::V0(ref v0_msg) = message {
-        for account in &all_accounts {
+        for account in &all_instruction_accounts {
             if !alt_account.addresses.contains(account) && !v0_msg.account_keys.contains(account) {
                 println!(
-                    "WARNING: Account {} not found in ALT or static accounts",
+                    "WARNING: Account {} from instruction not found in ALT or static accounts",
                     account
                 );
             }
         }
     }
-    let mut signers_set = HashSet::new();
-    let mut signers_to_provide: Vec<&Keypair> = Vec::new();
 
-    signers_set.insert(payer.pubkey());
-    signers_to_provide.push(payer);
-
+    // --- FIX: Collect all potential signers and order them correctly ---
+    let mut available_signers: std::collections::HashMap<Pubkey, &Keypair> =
+        std::collections::HashMap::new();
+    available_signers.insert(payer.pubkey(), payer);
     for signer in extra_signers {
-        if signers_set.insert(signer.pubkey()) {
-            signers_to_provide.push(signer);
-        } else {
-            println!("INFO: Skipping duplicate signer: {}", signer.pubkey());
+        if available_signers.insert(signer.pubkey(), signer).is_some() {
+            println!(
+                "INFO: Provided duplicate signer in extra_signers list: {}",
+                signer.pubkey()
+            );
         }
     }
+
+    let mut signers_to_provide: Vec<&Keypair> = Vec::new();
 
     if let VersionedMessage::V0(ref v0_msg) = message {
         println!("\n--- Signer Debugging ---");
@@ -131,6 +134,7 @@ async fn create_v0_tx_with_lookup(
         let static_keys = &v0_msg.account_keys;
 
         if num_required > static_keys.len() {
+            // This check is already there, keep it.
             println!(
                 "Error: Message header indicates more signers ({}) than static keys ({})!",
                 num_required,
@@ -139,57 +143,60 @@ async fn create_v0_tx_with_lookup(
             return Err(anyhow!(
                 "Internal Error: Compiled message has inconsistent signer count."
             ));
-        } else {
-            let required_signer_pubkeys = &static_keys[..num_required];
-            println!(
-                "Required Signer Pubkeys (determined by try_compile): {:?}",
-                required_signer_pubkeys
-            );
+        }
 
-            println!("Required signers: {:?}", required_signer_pubkeys);
-            for (i, pk) in required_signer_pubkeys.iter().enumerate() {
-                println!("Signer {}: {}", i, pk);
-            }
+        let required_signer_pubkeys = &static_keys[..num_required];
+        println!(
+            "Required Signer Pubkeys (determined by try_compile): {:?}",
+            required_signer_pubkeys
+        );
 
-            let provided_signer_pubkeys: Vec<Pubkey> =
-                signers_to_provide.iter().map(|s| s.pubkey()).collect();
-            println!(
-                "Provided Signer Pubkeys (for try_new): {:?}",
-                provided_signer_pubkeys
-            );
-
-            let mut missing = false;
-            for req_signer in required_signer_pubkeys {
-                if !provided_signer_pubkeys.contains(req_signer) {
-                    println!(
-                        "ERROR: Missing required signer in provided list: {}",
-                        req_signer
-                    );
-                    missing = true;
-                }
-            }
-
-            for prov_signer_key in &provided_signer_pubkeys {
-                if !required_signer_pubkeys.contains(prov_signer_key) {
-                    println!(
-                         "WARNING: Provided signer {} is NOT in the required list determined by try_compile.",
-                         prov_signer_key
-                     );
-                }
-            }
-
-            if missing {
-                return Err(anyhow!(
-                    "Debug Check Failed: Not all required signers were provided."
-                ));
+        // Build the signers_to_provide list IN THE REQUIRED ORDER
+        let mut missing_required_signer_keypair = false;
+        for required_pk in required_signer_pubkeys {
+            if let Some(keypair) = available_signers.get(required_pk) {
+                signers_to_provide.push(keypair);
             } else {
-                println!("Debug Check Passed: All required signers appear to be provided.");
+                // This means a Keypair for a required signer Pubkey was not passed to this function
+                println!(
+                    "ERROR: Keypair for required signer {} is missing from provided signers list.",
+                    required_pk
+                );
+                missing_required_signer_keypair = true;
             }
         }
+
+        if missing_required_signer_keypair {
+            return Err(anyhow!(
+                "Debug Check Failed: Not all required signer Keypairs were provided."
+            ));
+        }
+
+        // Optional: Verify that the provided signers list (after filtering and ordering)
+        // exactly matches the required signers list. try_new is strict.
+        let provided_signer_pubkeys_ordered: Vec<Pubkey> =
+            signers_to_provide.iter().map(|s| s.pubkey()).collect();
+
+        if provided_signer_pubkeys_ordered != required_signer_pubkeys {
+            println!("ERROR: Final provided signer order or set does NOT match required signers!");
+            println!("Provided (ordered): {:?}", provided_signer_pubkeys_ordered);
+            println!("Required: {:?}", required_signer_pubkeys);
+            // This case should ideally be caught by the missing_required_signer_keypair check
+            // and the way we build signers_to_provide, but keeping this check is safer.
+            return Err(anyhow!(
+                "Debug Check Failed: Final provided signer list mismatch."
+            ));
+        }
+
+        println!("Debug Check Passed: Signers are correctly identified and ordered.");
         println!("--- End Signer Debugging ---\n");
+    } else {
+        // This code only handles V0 messages
+        return Err(anyhow!("Only V0 messages are supported by this function."));
     }
 
     println!("Attempting to create signed VersionedTransaction...");
+    // Pass the correctly ordered list of required signers
     VersionedTransaction::try_new(message, &signers_to_provide)
         .map_err(|e| anyhow!("Failed to create VersionedTransaction (try_new): {}", e))
 }
@@ -255,14 +262,17 @@ async fn main() -> Result<()> {
         .get_minimum_balance_for_rent_exemption(spl_token::state::Account::LEN)
         .await?;
 
+    let input_amount = 1_000_000u64;
+    let slippage = Some(50u16);
+
     println!(
-        "Funding Transfer Authority with {} lamports...",
-        rent_exemption
+        "Funding Transfer Authority with {} lamports (rent + input amount)...",
+        rent_exemption + input_amount
     );
     let fund_transfer_auth_ix = system_instruction::transfer(
         &wallet.pubkey(),
         &transfer_authority.pubkey(),
-        rent_exemption,
+        rent_exemption + input_amount,
     );
 
     println!(
